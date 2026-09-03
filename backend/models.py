@@ -12,12 +12,34 @@ class Product(Base):
     __tablename__ = "products"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(Text, nullable=False)
-    category: Mapped[Optional[str]] = mapped_column(Text)
-    price: Mapped[int] = mapped_column(Integer, nullable=False)
-    stock: Mapped[int] = mapped_column(Integer, nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text)
-    max_discount_pct: Mapped[int] = mapped_column(Integer, default=0)
+
+    name: Mapped[str] = mapped_column(
+        Text,
+        nullable=False
+    )
+
+    category: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    price: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False
+    )
+
+    stock: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False
+    )
+
+    description: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    max_discount_pct: Mapped[int] = mapped_column(
+        Integer,
+        default=0
+    )
 
 
 class Mandate(Base):
@@ -29,51 +51,180 @@ class Mandate(Base):
         default=uuid.uuid4
     )
 
-    buyer_agent_id: Mapped[Optional[str]] = mapped_column(Text)
-    merchant_id: Mapped[Optional[str]] = mapped_column(Text)
+    buyer_agent_id: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    merchant_id: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
 
     product_id: Mapped[Optional[int]] = mapped_column(
         Integer,
         ForeignKey("products.id")
     )
 
-    quantity: Mapped[Optional[int]] = mapped_column(Integer)
-    agreed_price: Mapped[Optional[int]] = mapped_column(Integer)
+    quantity: Mapped[Optional[int]] = mapped_column(
+        Integer
+    )
 
-    currency: Mapped[str] = mapped_column(Text, default="INR")
-    status: Mapped[str] = mapped_column(Text, default="pending")
-    signature: Mapped[Optional[str]] = mapped_column(Text)
+    agreed_price: Mapped[Optional[int]] = mapped_column(
+        Integer
+    )
 
-    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    currency: Mapped[str] = mapped_column(
+        Text,
+        default="INR"
+    )
+
+    status: Mapped[str] = mapped_column(
+        Text,
+        default="pending"
+    )
+
+    signature: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime
+    )
+
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime
+    )
 
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-
-    mandate_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("mandates.mandate_id")
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True
     )
 
-    event_type: Mapped[str] = mapped_column(Text, nullable=False)
-    detail: Mapped[Optional[dict]] = mapped_column(JSON)
-    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Identifies the complete Buyer Agent execution.
+    # This exists even before a mandate is created.
+    session_id: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        index=True
+    )
+
+    # Becomes populated once the agent creates a mandate.
+    mandate_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("mandates.mandate_id"),
+        nullable=True
+    )
+
+    event_type: Mapped[str] = mapped_column(
+        Text,
+        nullable=False
+    )
+
+    detail: Mapped[Optional[dict]] = mapped_column(
+        JSON
+    )
+
+    created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime
+    )
 
 
 class RazorpayTransaction(Base):
     __tablename__ = "razorpay_transactions"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True
+    )
 
     mandate_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("mandates.mandate_id")
     )
 
-    razorpay_order_id: Mapped[Optional[str]] = mapped_column(Text)
-    razorpay_payment_id: Mapped[Optional[str]] = mapped_column(Text)
-    status: Mapped[Optional[str]] = mapped_column(Text)
-    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    razorpay_order_id: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    razorpay_payment_id: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    status: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime
+    )
+
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True
+    )
+
+    order_number: Mapped[str] = mapped_column(
+        Text,
+        unique=True,
+        nullable=False
+    )
+
+    buyer_id: Mapped[str] = mapped_column(
+        Text,
+        nullable=False
+    )
+
+    mandate_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("mandates.mandate_id"),
+        unique=True,
+        nullable=False
+    )
+
+    product_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("products.id"),
+        nullable=False
+    )
+
+    quantity: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False
+    )
+
+    amount: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False
+    )
+
+    currency: Mapped[str] = mapped_column(
+        Text,
+        default="INR",
+        nullable=False
+    )
+
+    razorpay_order_id: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    razorpay_payment_id: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
+    status: Mapped[str] = mapped_column(
+        Text,
+        default="confirmed",
+        nullable=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False
+    )

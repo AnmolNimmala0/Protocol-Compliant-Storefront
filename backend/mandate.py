@@ -17,13 +17,32 @@ if HMAC_SECRET is None:
     raise ValueError("HMAC_SECRET is not set in .env")
 
 
+# =========================================================
+# HMAC SIGNATURE
+# =========================================================
+
 def generate_signature(
     buyer_id,
     product_id,
     quantity,
     agreed_price
 ):
-    message = f"{buyer_id}|{product_id}|{quantity}|{agreed_price}"
+    """
+    Generate a tamper-evident HMAC signature for a mandate.
+
+    The signature binds together:
+        buyer_id
+        product_id
+        quantity
+        agreed_price
+    """
+
+    message = (
+        f"{buyer_id}|"
+        f"{product_id}|"
+        f"{quantity}|"
+        f"{agreed_price}"
+    )
 
     signature = hmac.new(
         HMAC_SECRET.encode(),
@@ -34,19 +53,34 @@ def generate_signature(
     return signature
 
 
+# =========================================================
+# CREATE MANDATE
+# =========================================================
+
 def create_mandate(
     buyer_id,
     product_id,
     quantity,
     agreed_price
 ):
+    """
+    Create a pending financial mandate.
+
+    The mandate is signed using HMAC and expires after
+    five minutes.
+    """
+
     db = SessionLocal()
 
     try:
         mandate_id = uuid.uuid4()
 
         created_at = datetime.now(timezone.utc)
-        expires_at = created_at + timedelta(minutes=5)
+
+        expires_at = (
+            created_at +
+            timedelta(minutes=5)
+        )
 
         signature = generate_signature(
             buyer_id,
@@ -81,8 +115,32 @@ def create_mandate(
         db.close()
 
 
-def log_audit_event(db, mandate_id, event_type, detail):
+# =========================================================
+# AUDIT LOG
+# =========================================================
+
+def log_audit_event(
+    db,
+    mandate_id,
+    event_type,
+    detail,
+    session_id=None
+):
+    """
+    Record an event in the audit trail.
+
+    session_id:
+        Identifies the complete Buyer Agent execution.
+
+    mandate_id:
+        Identifies the financial mandate once one exists.
+
+    Both are optional because some events occur before
+    mandate creation.
+    """
+
     audit = AuditLog(
+        session_id=session_id,
         mandate_id=mandate_id,
         event_type=event_type,
         detail=detail,
@@ -93,19 +151,48 @@ def log_audit_event(db, mandate_id, event_type, detail):
     db.commit()
 
 
+# =========================================================
+# VALIDATE MANDATE
+# =========================================================
+
 def validate_mandate(mandate_id):
+    """
+    Validate a mandate immediately before financial execution.
+
+    Checks:
+
+    1. Mandate exists
+    2. HMAC signature is valid
+    3. Mandate has not expired
+    4. Mandate has not already been used
+    5. Product still exists
+    6. Live stock is sufficient
+    7. Agreed price respects merchant discount policy
+    """
+
     db = SessionLocal()
 
     try:
-        # 1. Find mandate
-        mandate = db.query(Mandate).filter(
-            Mandate.mandate_id == mandate_id
-        ).first()
+
+        # -----------------------------------------------------
+        # 1. FIND MANDATE
+        # -----------------------------------------------------
+
+        mandate = (
+            db.query(Mandate)
+            .filter(
+                Mandate.mandate_id == mandate_id
+            )
+            .first()
+        )
 
         if mandate is None:
             return False, "Mandate not found"
 
-        # 2. Verify signature
+        # -----------------------------------------------------
+        # 2. VERIFY SIGNATURE
+        # -----------------------------------------------------
+
         expected_signature = generate_signature(
             mandate.buyer_agent_id,
             mandate.product_id,
@@ -114,6 +201,7 @@ def validate_mandate(mandate_id):
         )
 
         if mandate.signature is None:
+
             mandate.status = "declined"
             db.commit()
 
@@ -121,7 +209,9 @@ def validate_mandate(mandate_id):
                 db,
                 mandate.mandate_id,
                 "validation_failed",
-                {"reason": "Mandate has no signature"}
+                {
+                    "reason": "Mandate has no signature"
+                }
             )
 
             return False, "Mandate has no signature"
@@ -130,6 +220,7 @@ def validate_mandate(mandate_id):
             expected_signature,
             str(mandate.signature)
         ):
+
             mandate.status = "declined"
             db.commit()
 
@@ -137,21 +228,44 @@ def validate_mandate(mandate_id):
                 db,
                 mandate.mandate_id,
                 "validation_failed",
-                {"reason": "Invalid mandate signature"}
+                {
+                    "reason": "Invalid mandate signature"
+                }
             )
 
             return False, "Invalid mandate signature"
 
-        # 3. Check expiry
+        # -----------------------------------------------------
+        # 3. CHECK EXPIRY
+        # -----------------------------------------------------
+
         now = datetime.now(timezone.utc)
 
+        if mandate.expires_at is None:
+            mandate.status = "declined"
+            db.commit()
+
+            log_audit_event(
+                db,
+                mandate.mandate_id,
+                "validation_failed",
+                {
+                    "reason": "Mandate has no expiry time"
+                }
+            )
+
+            return False, "Mandate has no expiry time"
+
         expires_at = (
-            mandate.expires_at.replace(tzinfo=timezone.utc)
+            mandate.expires_at.replace(
+                tzinfo=timezone.utc
+            )
             if mandate.expires_at.tzinfo is None
             else mandate.expires_at
         )
 
         if now >= expires_at:
+
             mandate.status = "declined"
             db.commit()
 
@@ -159,13 +273,19 @@ def validate_mandate(mandate_id):
                 db,
                 mandate.mandate_id,
                 "validation_failed",
-                {"reason": "Mandate has expired"}
+                {
+                    "reason": "Mandate has expired"
+                }
             )
 
             return False, "Mandate has expired"
 
-        # 4. Replay check
+        # -----------------------------------------------------
+        # 4. REPLAY CHECK
+        # -----------------------------------------------------
+
         if mandate.status != "pending":
+
             previous_status = mandate.status
 
             mandate.status = "declined"
@@ -186,12 +306,20 @@ def validate_mandate(mandate_id):
                 f"status is {previous_status}"
             )
 
-        # 5. Get current product
-        product = db.query(Product).filter(
-            Product.id == mandate.product_id
-        ).first()
+        # -----------------------------------------------------
+        # 5. GET CURRENT PRODUCT
+        # -----------------------------------------------------
+
+        product = (
+            db.query(Product)
+            .filter(
+                Product.id == mandate.product_id
+            )
+            .first()
+        )
 
         if product is None:
+
             mandate.status = "declined"
             db.commit()
 
@@ -199,13 +327,19 @@ def validate_mandate(mandate_id):
                 db,
                 mandate.mandate_id,
                 "validation_failed",
-                {"reason": "Product no longer exists"}
+                {
+                    "reason": "Product no longer exists"
+                }
             )
 
             return False, "Product no longer exists"
 
-        # 6. Check live stock
+        # -----------------------------------------------------
+        # 6. CHECK LIVE STOCK
+        # -----------------------------------------------------
+
         if product.stock < mandate.quantity:
+
             mandate.status = "declined"
             db.commit()
 
@@ -222,14 +356,22 @@ def validate_mandate(mandate_id):
 
             return False, "Insufficient stock"
 
-        # 7. Check merchant discount policy
-        max_discount = product.max_discount_pct or 0
+        # -----------------------------------------------------
+        # 7. CHECK MERCHANT DISCOUNT POLICY
+        # -----------------------------------------------------
+
+        max_discount = (
+            product.max_discount_pct or 0
+        )
 
         minimum_price = (
-            product.price * (100 - max_discount) // 100
+            product.price *
+            (100 - max_discount) //
+            100
         )
 
         if mandate.agreed_price < minimum_price:
+
             mandate.status = "declined"
             db.commit()
 
@@ -252,12 +394,11 @@ def validate_mandate(mandate_id):
                 "merchant discount policy"
             )
 
-        # All checks passed
+        # -----------------------------------------------------
+        # ALL CHECKS PASSED
+        # -----------------------------------------------------
+
         return True, None
 
     finally:
         db.close()
-
-
-
-
