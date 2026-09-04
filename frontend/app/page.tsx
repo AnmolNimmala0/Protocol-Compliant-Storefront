@@ -106,6 +106,48 @@ function eventIcon(eventType: string) {
   return "✓";
 }
 
+function prettyJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function terminalOutput(event: EventItem) {
+
+  const lines = [
+    `$ event: ${event.event_type}`,
+    `$ timestamp: ${new Date(event.created_at).toLocaleString()}`,
+    `$ session_id: ${event.session_id}`,
+  ];
+
+  if (event.mandate_id) {
+    lines.push(`$ mandate_id: ${event.mandate_id}`);
+  }
+
+  lines.push("");
+  lines.push("$ recorded detail:");
+  lines.push(prettyJson(event.detail));
+
+  return lines.join("\n");
+}
+
+function negotiationTerminalOutput(events: EventItem[]) {
+  return events
+    .map((event) => {
+      const timestamp = new Date(event.created_at).toLocaleString();
+      return [
+        `>>> ${formatEvent(event)}`,
+        `timestamp: ${timestamp}`,
+        `event_type: ${event.event_type}`,
+        "",
+        prettyJson(event.detail),
+      ].join("\n");
+    })
+    .join("\n\n" + "─".repeat(72) + "\n\n");
+}
+
 function categoryEmoji(category?: string | null) {
   const value = (category || "").toLowerCase();
   if (value.includes("yoga")) return "🧘";
@@ -138,10 +180,15 @@ export default function Home() {
   const [paymentLoading, setPaymentLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pollingVersion, setPollingVersion] = useState(0);
+  const [detailEvent, setDetailEvent] = useState<EventItem | null>(null);
+  const [showNegotiationDetails, setShowNegotiationDetails] = useState(false);
 
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
   const latestEvent = events[events.length - 1];
+  const negotiationTimeline = events.filter((e) =>
+    e.event_type.includes("negotiation")
+  );
 
   const loadStore = async () => {
     try {
@@ -653,8 +700,8 @@ export default function Home() {
                       </div>
                       <div
                         className={`mt-1 text-xs ${product.stock > 0
-                            ? "text-emerald-600"
-                            : "text-red-500"
+                          ? "text-emerald-600"
+                          : "text-red-500"
                           }`}
                       >
                         {product.stock > 0
@@ -1000,45 +1047,13 @@ export default function Home() {
                         </div>
                       )}
 
-                      {!loading &&
-                        session?.status === "answered" &&
-                        (!session?.messages ||
-                          !session.messages.some(
-                            (message) => message.role === "assistant"
-                          )) &&
-                        (() => {
-                          const responseEvents = events.filter(
-                            (event) => event.event_type === "assistant_response"
-                          );
-
-                          const lastResponse =
-                            responseEvents[responseEvents.length - 1];
-
-                          if (!lastResponse) return null;
-
-                          const answer =
-                            typeof lastResponse.detail === "string"
-                              ? lastResponse.detail
-                              : lastResponse.detail?.answer;
-
-                          if (!answer) return null;
-
-                          return (
-                            <div className="mt-6 flex gap-4">
-                              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white text-sm font-bold text-black">
-                                A
-                              </div>
-                              <div className="min-w-0 max-w-2xl flex-1">
-                                <div className="mb-2 text-sm font-medium">
-                                  Buyer Agent
-                                </div>
-                                <div className="whitespace-pre-wrap rounded-2xl border border-zinc-800 bg-zinc-900 p-5 text-sm leading-6 text-zinc-300">
-                                  {answer}
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })()}
+                      {!loading && latestEvent && session?.status === "answered" && !session?.messages?.some((message) => message.role === "assistant") && (
+                        <div className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900 p-5">
+                          <p className="text-sm text-zinc-300">
+                            {formatEvent(latestEvent)}
+                          </p>
+                        </div>
+                      )}
 
                       {selectedProduct && (
                         <div className="mt-5 rounded-xl bg-zinc-950 p-4">
@@ -1063,10 +1078,19 @@ export default function Home() {
                       )}
 
                       {negotiationEvent && (
-                        <div className="mt-4 rounded-xl border border-zinc-700 bg-zinc-950 p-4">
-                          <div className="mb-3 flex items-center gap-2 text-xs font-medium text-zinc-400">
-                            <span>⇄</span>
-                            AGENT-TO-AGENT NEGOTIATION
+                        <button
+                          type="button"
+                          onClick={() => setShowNegotiationDetails(true)}
+                          className="mt-4 w-full rounded-xl border border-zinc-700 bg-zinc-950 p-4 text-left transition hover:border-purple-400/50 hover:bg-zinc-900"
+                        >
+                          <div className="mb-3 flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 text-xs font-medium text-zinc-400">
+                              <span>⇄</span>
+                              AGENT-TO-AGENT NEGOTIATION
+                            </div>
+                            <span className="text-[10px] text-zinc-600">
+                              Click to inspect
+                            </span>
                           </div>
 
                           <div className="space-y-3 text-sm">
@@ -1095,7 +1119,7 @@ export default function Home() {
                               </div>
                             )}
                           </div>
-                        </div>
+                        </button>
                       )}
 
                       {isAwaitingPayment && authorizationEvent && (
@@ -1245,28 +1269,36 @@ export default function Home() {
                             event.event_type === "payment_captured";
 
                           return (
-                            <div
+                            <button
+                              type="button"
                               key={event.id}
-                              className={`rounded-xl p-3 ${isImportant
-                                  ? "bg-zinc-900"
-                                  : "hover:bg-zinc-900/50"
+                              onClick={() => setDetailEvent(event)}
+                              aria-label={`Inspect ${formatEvent(event)}`}
+                              className={`w-full rounded-xl p-3 text-left transition ${isImportant
+                                ? "bg-zinc-900 hover:bg-zinc-800"
+                                : "hover:bg-zinc-900/50"
                                 }`}
                             >
                               <div className="flex gap-3">
                                 <div
                                   className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs ${isNegotiation
-                                      ? "bg-purple-500/10 text-purple-400"
-                                      : isImportant
-                                        ? "bg-amber-500/10 text-amber-400"
-                                        : "bg-emerald-500/10 text-emerald-400"
+                                    ? "bg-purple-500/10 text-purple-400"
+                                    : isImportant
+                                      ? "bg-amber-500/10 text-amber-400"
+                                      : "bg-emerald-500/10 text-emerald-400"
                                     }`}
                                 >
                                   {eventIcon(event.event_type)}
                                 </div>
 
                                 <div className="min-w-0 flex-1">
-                                  <div className="text-xs text-zinc-300">
-                                    {formatEvent(event)}
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="text-xs text-zinc-300">
+                                      {formatEvent(event)}
+                                    </div>
+                                    <span className="text-[10px] text-zinc-600">
+                                      View details
+                                    </span>
                                   </div>
                                   <div className="mt-1 text-[10px] text-zinc-600">
                                     {new Date(
@@ -1275,7 +1307,7 @@ export default function Home() {
                                   </div>
                                 </div>
                               </div>
-                            </div>
+                            </button>
                           );
                         })}
                       </div>
@@ -1305,6 +1337,157 @@ export default function Home() {
                   </div>
                 </div>
               </aside>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================
+          TRACE EVENT DETAILS
+      ====================================================== */}
+
+      {detailEvent && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          onClick={() => setDetailEvent(null)}
+        >
+          <div
+            className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 text-white shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+              <div>
+                <div className="text-xs font-semibold tracking-[0.18em] text-emerald-400">
+                  EXECUTION TRACE
+                </div>
+                <h3 className="mt-1 text-lg font-semibold">
+                  {formatEvent(detailEvent)}
+                </h3>
+                <p className="mt-1 text-xs text-zinc-500">
+                  Clicked trace event · full recorded execution detail
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setDetailEvent(null)}
+                className="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-800 text-zinc-400 hover:text-white"
+                aria-label="Close trace details"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="min-h-0 overflow-y-auto p-5 sm:p-6">
+              <div className="mb-3 flex items-center justify-between">
+                <div className="text-xs font-semibold tracking-[0.18em] text-zinc-500">
+                  TERMINAL OUTPUT
+                </div>
+                <span className="font-mono text-[10px] text-zinc-600">
+                  event #{detailEvent.id}
+                </span>
+              </div>
+
+              <div className="overflow-hidden rounded-xl border border-zinc-800 bg-black">
+                <div className="flex items-center gap-1.5 border-b border-zinc-900 px-4 py-2.5">
+                  <span className="h-2.5 w-2.5 rounded-full bg-zinc-700" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-zinc-700" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-zinc-700" />
+                  <span className="ml-2 font-mono text-[10px] text-zinc-600">
+                    agent-execution
+                  </span>
+                </div>
+
+                <pre className="max-h-[55vh] overflow-auto p-4 font-mono text-[11px] leading-5 text-zinc-300">
+                  {terminalOutput(detailEvent)}
+                </pre>
+              </div>
+
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-lg bg-zinc-900 p-3">
+                  <div className="text-[10px] tracking-wider text-zinc-600">
+                    EVENT TYPE
+                  </div>
+                  <div className="mt-1 break-all font-mono text-xs text-zinc-400">
+                    {detailEvent.event_type}
+                  </div>
+                </div>
+
+                <div className="rounded-lg bg-zinc-900 p-3">
+                  <div className="text-[10px] tracking-wider text-zinc-600">
+                    MANDATE
+                  </div>
+                  <div className="mt-1 break-all font-mono text-xs text-zinc-400">
+                    {detailEvent.mandate_id || "Not created yet"}
+                  </div>
+                </div>
+              </div>
+
+              <p className="mt-4 text-[11px] leading-5 text-zinc-600">
+                This view exposes the structured execution data recorded by the
+                backend for this step, rather than hidden model chain-of-thought.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================
+          NEGOTIATION TRACE DETAILS
+      ====================================================== */}
+
+      {showNegotiationDetails && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          onClick={() => setShowNegotiationDetails(false)}
+        >
+          <div
+            className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 text-white shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+              <div>
+                <div className="text-xs font-semibold tracking-[0.18em] text-purple-400">
+                  AGENT-TO-AGENT NEGOTIATION
+                </div>
+                <h3 className="mt-1 text-lg font-semibold">
+                  Complete negotiation output
+                </h3>
+                <p className="mt-1 text-xs text-zinc-500">
+                  Buyer and Merchant Agent events, shown as recorded execution output.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowNegotiationDetails(false)}
+                className="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-800 text-zinc-400 hover:text-white"
+                aria-label="Close negotiation details"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="min-h-0 overflow-y-auto p-5 sm:p-6">
+              <div className="overflow-hidden rounded-xl border border-zinc-800 bg-black">
+                <div className="flex items-center gap-1.5 border-b border-zinc-900 px-4 py-2.5">
+                  <span className="h-2.5 w-2.5 rounded-full bg-zinc-700" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-zinc-700" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-zinc-700" />
+                  <span className="ml-2 font-mono text-[10px] text-zinc-600">
+                    negotiation-agent-execution
+                  </span>
+                </div>
+
+                <pre className="max-h-[65vh] overflow-auto p-4 font-mono text-[11px] leading-5 text-zinc-300">
+                  {negotiationTerminalOutput(negotiationTimeline)}
+                </pre>
+              </div>
+
+              <div className="mt-4 text-[11px] leading-5 text-zinc-600">
+                The trace is backed by the audit events already being recorded
+                during the live agent run.
+              </div>
             </div>
           </div>
         </div>
