@@ -2,7 +2,7 @@
 
 **Making a merchant transactable by AI buyers**
 
-Agentic Shop turns a normal merchant, FitStore, into a system that an AI buyer can discover, negotiate with, pay, and transact with — end to end.
+Agentic Shop turns a normal merchant,into a system that an AI buyer can discover, negotiate with, pay, and transact with — end to end.
 
 > The model can reason. The software controls the money.
 
