@@ -1,9 +1,6 @@
-import os
 import json
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field
 from typing import Literal
 
@@ -21,9 +18,7 @@ load_dotenv()
 
 mcp = MCPServer("Merchant Agent", version="1.0.0")
 
-gemini = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+from ai_client import generate
 
 
 # =========================================================
@@ -374,17 +369,13 @@ accept, counter, or decline.
 Return ONLY the structured response.
 """
 
-        llm_response = gemini.models.generate_content(
-            model="gemini-3.5-flash-lite",
+        response_text = generate(
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=MerchantReasoning
-            )
+            response_schema=MerchantReasoning,
         )
 
         merchant_reasoning = MerchantReasoning.model_validate_json(
-            llm_response.text
+            response_text
         )
 
         print("\n🤖 Merchant Agent reasoning:")

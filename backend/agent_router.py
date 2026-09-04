@@ -1,12 +1,9 @@
 import json
-import os
 from datetime import datetime, timezone
 from typing import Literal
 
 from dotenv import load_dotenv
 from mcp import Client
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field
 
 from database import SessionLocal
@@ -25,12 +22,10 @@ MCP_SERVER_URL = "http://127.0.0.1:8001/mcp"
 
 
 # =========================================================
-# GEMINI
+# AI CLIENT
 # =========================================================
 
-gemini = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+from ai_client import generate
 
 
 # =========================================================
@@ -266,17 +261,13 @@ IMPORTANT:
 Return ONLY the structured intent.
 """
 
-    response = gemini.models.generate_content(
-        model="gemini-3.5-flash-lite",
+    response_text = generate(
         contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=RequestIntent,
-        ),
+        response_schema=RequestIntent,
     )
 
     return RequestIntent.model_validate_json(
-        response.text
+        response_text
     )
 
 
@@ -412,17 +403,13 @@ Rules:
 Return ONLY the structured answer.
 """
 
-    response = gemini.models.generate_content(
-        model="gemini-3.5-flash-lite",
+    response_text = generate(
         contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=StoreAnswer,
-        ),
+        response_schema=StoreAnswer,
     )
 
     return StoreAnswer.model_validate_json(
-        response.text
+        response_text
     )
 
 

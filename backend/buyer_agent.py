@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import requests
 
 from datetime import datetime, timezone
@@ -10,8 +9,6 @@ from dotenv import load_dotenv
 
 from mcp import Client
 
-from google import genai
-from google.genai import types
 
 from pydantic import BaseModel, Field
 
@@ -158,12 +155,10 @@ class NegotiationDecision(BaseModel):
 
 
 # =========================================================
-# GEMINI CLIENT
+# AI CLIENT
 # =========================================================
 
-gemini = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+from ai_client import generate
 
 
 # =========================================================
@@ -356,50 +351,20 @@ IMPORTANT CUSTOMER-CONSTRAINT RULES:
 16. Return ONLY the structured ShoppingProposal.
 """
 
-    models = [
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-flash",
-    ]
-
-    for model in models:
-
-        print(
-            f"\n🧠 Trying model: {model}"
-        )
-
-        try:
-
-            response = gemini.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ShoppingProposal,
-                ),
-            )
-
-            proposal = (
-                ShoppingProposal
-                .model_validate_json(
-                    response.text
-                )
-            )
-
-            print(
-                f"✅ {model} responded successfully"
-            )
-
-            return proposal
-
-        except Exception as e:
-
-            print(
-                f"⚠️ {model} failed: {e}"
-            )
-
-    raise RuntimeError(
-        "All configured Gemini models are currently unavailable."
+    response_text = generate(
+        contents=prompt,
+        response_schema=ShoppingProposal,
     )
+
+    proposal = ShoppingProposal.model_validate_json(
+        response_text
+    )
+
+    print(
+        "✅ Buyer Agent product selection completed"
+    )
+
+    return proposal
 
 
 # =========================================================
@@ -581,63 +546,32 @@ The deterministic system will independently verify any
 financial agreement before creating a mandate.
 """
 
-    models = [
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-flash",
-    ]
-
-    for model in models:
-
-        print(
-            f"\n🧠 Trying negotiation model: {model}"
-        )
-
-        try:
-
-            response = gemini.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=NegotiationDecision,
-                ),
-            )
-
-            decision = (
-                NegotiationDecision
-                .model_validate_json(
-                    response.text
-                )
-            )
-
-            print(
-                f"✅ {model} negotiation reasoning completed"
-            )
-
-            print(
-                "\n🤝 Buyer Agent negotiation decision:"
-            )
-
-            print(
-                json.dumps(
-                    decision.model_dump(),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
-
-            return decision
-
-        except Exception as e:
-
-            print(
-                f"⚠️ {model} failed: {e}"
-            )
-
-    raise RuntimeError(
-        "All configured Gemini negotiation models "
-        "are currently unavailable."
+    response_text = generate(
+        contents=prompt,
+        response_schema=NegotiationDecision,
     )
+
+    decision = NegotiationDecision.model_validate_json(
+        response_text
+    )
+
+    print(
+        "✅ Buyer Agent negotiation reasoning completed"
+    )
+
+    print(
+        "\n🤝 Buyer Agent negotiation decision:"
+    )
+
+    print(
+        json.dumps(
+            decision.model_dump(),
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
+    return decision
 
 
 # =========================================================
