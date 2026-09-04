@@ -5,7 +5,6 @@ from fastapi import (
     Request,
     BackgroundTasks,
 )
-
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
@@ -13,11 +12,13 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 
 from datetime import datetime, timezone
+import asyncio
 
 import os
 import hmac
 import hashlib
 import uuid
+
 
 from database import SessionLocal
 
@@ -46,13 +47,14 @@ from agent_session import (
     get_session,
 )
 
+from agent_router import route_request
+
 
 # =========================================================
 # ENVIRONMENT
 # =========================================================
 
 load_dotenv()
-
 
 RAZORPAY_WEBHOOK_SECRET = os.getenv(
     "RAZORPAY_WEBHOOK_SECRET"
@@ -65,7 +67,7 @@ if RAZORPAY_WEBHOOK_SECRET is None:
 
 
 # =========================================================
-# FITSTORE IDENTITY
+# MERCHANT IDENTITY
 # =========================================================
 
 MERCHANT_NAME = "FitStore"
@@ -106,7 +108,7 @@ app.add_middleware(
 
 
 # =========================================================
-# DATABASE DEPENDENCY
+# DATABASE
 # =========================================================
 
 def get_db():
@@ -140,23 +142,56 @@ class ShoppingRequest(BaseModel):
     shopping_brief: str
 
 
+# =========================================================
+# BACKGROUND AGENT EXECUTION
+# =========================================================
+
 def run_agent_background(
     shopping_brief: str,
     session_id: str,
 ):
     """
-    Run the Buyer Agent in the background.
+    Use the Gemini-powered router as the first decision layer.
 
-    The frontend receives the session ID immediately
-    while the Buyer Agent continues executing.
+    Non-purchase requests are answered by the router using the
+    merchant MCP catalog and Gemini. Purchase requests are handed
+    to the existing Buyer Agent without changing the working
+    purchase/payment pipeline.
     """
 
     try:
+        result = asyncio.run(
+            route_request(
+                shopping_brief=shopping_brief,
+                session_id=session_id,
+            )
+        )
+
+        intent = result.get("intent")
+
+        if intent != "purchase":
+            print(
+                f"\n💬 Non-purchase request answered by router: {intent}"
+            )
+
+            update_session(
+                session_id=session_id,
+                status="answered",
+                mandate_id=None,
+            )
+            return
+
+        print("\n🛒 Purchase intent confirmed by Gemini router.")
 
         from buyer_agent import run_buyer_agent
 
+        buyer_brief = (
+            result.get("conversation_context")
+            or shopping_brief
+        )
+
         mandate_id = run_buyer_agent(
-            shopping_brief=shopping_brief,
+            shopping_brief=buyer_brief,
             session_id=session_id,
         )
 
@@ -171,11 +206,9 @@ def run_agent_background(
         )
 
     except Exception as e:
-
         print(
-            f"❌ Agent session {session_id} failed:"
+            f"\n❌ Agent session {session_id} failed:"
         )
-
         print(str(e))
 
         update_session(
@@ -198,7 +231,9 @@ def start_agent_shop(
 
         raise HTTPException(
             status_code=400,
-            detail="shopping_brief cannot be empty",
+            detail=(
+                "shopping_brief cannot be empty"
+            ),
         )
 
     session_id = create_session()
@@ -210,27 +245,81 @@ def start_agent_shop(
     )
 
     return {
+        "session_id":
+            session_id,
+        "status":
+            "running",
+    }
+
+@app.post("/agent/sessions/{session_id}/message")
+async def send_agent_message(
+    session_id: str,
+    request: ShoppingRequest,
+    background_tasks: BackgroundTasks,
+):
+    session = get_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    if not request.shopping_brief.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="shopping_brief cannot be empty",
+        )
+
+    if session["status"] == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="Agent is still processing the previous message",
+        )
+
+    if session["status"] == "awaiting_payment":
+        raise HTTPException(
+            status_code=409,
+            detail="This session is awaiting payment",
+        )
+
+    update_session(
+        session_id=session_id,
+        status="running",
+    )
+
+    background_tasks.add_task(
+        run_agent_background,
+        request.shopping_brief,
+        session_id,
+    )
+
+    return {
         "session_id": session_id,
         "status": "running",
     }
-
-
 # =========================================================
 # GET AGENT SESSION STATUS
 # =========================================================
 
-@app.get("/agent/sessions/{session_id}")
+@app.get(
+    "/agent/sessions/{session_id}"
+)
 def get_agent_session(
     session_id: str,
 ):
 
-    session = get_session(session_id)
+    session = get_session(
+        session_id
+    )
 
     if session is None:
 
         raise HTTPException(
             status_code=404,
-            detail="Agent session not found",
+            detail=(
+                "Agent session not found"
+            ),
         )
 
     return session
@@ -240,25 +329,32 @@ def get_agent_session(
 # GET AGENT EXECUTION EVENTS
 # =========================================================
 
-@app.get("/agent/sessions/{session_id}/events")
+@app.get(
+    "/agent/sessions/{session_id}/events"
+)
 def get_agent_events(
     session_id: str,
     db: Session = Depends(get_db),
 ):
 
-    session = get_session(session_id)
+    session = get_session(
+        session_id
+    )
 
     if session is None:
 
         raise HTTPException(
             status_code=404,
-            detail="Agent session not found",
+            detail=(
+                "Agent session not found"
+            ),
         )
 
     events = (
         db.query(AuditLog)
         .filter(
-            AuditLog.session_id == session_id
+            AuditLog.session_id
+            == session_id
         )
         .order_by(
             AuditLog.id.asc()
@@ -268,25 +364,31 @@ def get_agent_events(
 
     return [
         {
-            "id": event.id,
+            "id":
+                event.id,
 
-            "session_id": event.session_id,
+            "session_id":
+                event.session_id,
 
-            "mandate_id": (
-                str(event.mandate_id)
-                if event.mandate_id
-                else None
-            ),
+            "mandate_id":
+                (
+                    str(event.mandate_id)
+                    if event.mandate_id
+                    else None
+                ),
 
-            "event_type": event.event_type,
+            "event_type":
+                event.event_type,
 
-            "detail": event.detail,
+            "detail":
+                event.detail,
 
-            "created_at": (
-                event.created_at.isoformat()
-                if event.created_at
-                else None
-            ),
+            "created_at":
+                (
+                    event.created_at.isoformat()
+                    if event.created_at
+                    else None
+                ),
         }
 
         for event in events
@@ -304,14 +406,18 @@ def get_products(
 
     products = (
         db.query(Product)
-        .order_by(Product.id.asc())
+        .order_by(
+            Product.id.asc()
+        )
         .all()
     )
 
     return products
 
 
-@app.get("/products/{product_id}")
+@app.get(
+    "/products/{product_id}"
+)
 def get_product(
     product_id: int,
     db: Session = Depends(get_db),
@@ -335,7 +441,9 @@ def get_product(
     return product
 
 
-@app.get("/products/{product_id}/availability")
+@app.get(
+    "/products/{product_id}/availability"
+)
 def check_availability(
     product_id: int,
     qty: int,
@@ -346,7 +454,9 @@ def check_availability(
 
         raise HTTPException(
             status_code=400,
-            detail="Quantity must be greater than zero",
+            detail=(
+                "Quantity must be greater than zero"
+            ),
         )
 
     product = (
@@ -360,27 +470,49 @@ def check_availability(
     if product is None:
 
         return {
-            "available": False,
-            "reason": "Product not found",
+            "available":
+                False,
+            "reason":
+                "Product not found",
         }
 
     if product.stock >= qty:
 
         return {
-            "available": True,
-            "product_id": product.id,
-            "product_name": product.name,
-            "requested_qty": qty,
-            "stock": product.stock,
+            "available":
+                True,
+
+            "product_id":
+                product.id,
+
+            "product_name":
+                product.name,
+
+            "requested_qty":
+                qty,
+
+            "stock":
+                product.stock,
         }
 
     return {
-        "available": False,
-        "product_id": product.id,
-        "product_name": product.name,
-        "requested_qty": qty,
-        "stock": product.stock,
-        "reason": "Insufficient stock",
+        "available":
+            False,
+
+        "product_id":
+            product.id,
+
+        "product_name":
+            product.name,
+
+        "requested_qty":
+            qty,
+
+        "stock":
+            product.stock,
+
+        "reason":
+            "Insufficient stock",
     }
 
 
@@ -392,14 +524,25 @@ def check_availability(
 def get_merchant():
 
     return {
-        "merchant_id": MERCHANT_ID,
-        "name": MERCHANT_NAME,
-        "description": (
-            "MCP-enabled fitness ecommerce store"
-        ),
-        "currency": "INR",
-        "agent_enabled": True,
-        "mcp_enabled": True,
+        "merchant_id":
+            MERCHANT_ID,
+
+        "name":
+            MERCHANT_NAME,
+
+        "description":
+            (
+                "MCP-enabled general ecommerce store"
+            ),
+
+        "currency":
+            "INR",
+
+        "agent_enabled":
+            True,
+
+        "mcp_enabled":
+            True,
     }
 
 
@@ -411,11 +554,20 @@ def get_merchant():
 def get_terms():
 
     return {
-        "merchant_id": MERCHANT_ID,
-        "merchant_name": MERCHANT_NAME,
-        "currency": "INR",
-        "max_discount_pct": 10,
-        "mandate_expiry_minutes": 30,
+        "merchant_id":
+            MERCHANT_ID,
+
+        "merchant_name":
+            MERCHANT_NAME,
+
+        "currency":
+            "INR",
+
+        "max_discount_pct":
+            10,
+
+        "mandate_expiry_minutes":
+            30,
     }
 
 
@@ -423,7 +575,9 @@ def get_terms():
 # MANDATE DETAILS
 # =========================================================
 
-@app.get("/mandates/{mandate_id}")
+@app.get(
+    "/mandates/{mandate_id}"
+)
 def get_mandate(
     mandate_id: str,
     db: Session = Depends(get_db),
@@ -432,7 +586,8 @@ def get_mandate(
     mandate = (
         db.query(Mandate)
         .filter(
-            Mandate.mandate_id == mandate_id
+            Mandate.mandate_id
+            == mandate_id
         )
         .first()
     )
@@ -445,9 +600,8 @@ def get_mandate(
         )
 
     return {
-        "mandate_id": str(
-            mandate.mandate_id
-        ),
+        "mandate_id":
+            str(mandate.mandate_id),
 
         "buyer_agent_id":
             mandate.buyer_agent_id,
@@ -473,22 +627,24 @@ def get_mandate(
         "signature":
             mandate.signature,
 
-        "created_at": (
-            mandate.created_at.isoformat()
-            if mandate.created_at
-            else None
-        ),
+        "created_at":
+            (
+                mandate.created_at.isoformat()
+                if mandate.created_at
+                else None
+            ),
 
-        "expires_at": (
-            mandate.expires_at.isoformat()
-            if mandate.expires_at
-            else None
-        ),
+        "expires_at":
+            (
+                mandate.expires_at.isoformat()
+                if mandate.expires_at
+                else None
+            ),
     }
 
 
 # =========================================================
-# FITSTORE ORDER CREATION
+# CREATE FITSTORE ORDER
 # =========================================================
 
 def create_fitstore_order(
@@ -497,22 +653,9 @@ def create_fitstore_order(
     transaction,
     razorpay_payment_id,
 ):
-    """
-    Convert a successfully paid mandate into
-    a real FitStore order.
-
-    This function is deterministic.
-
-    No LLM is involved in order creation.
-
-    A mandate represents authorization to purchase.
-
-    An Order represents the actual completed
-    commerce transaction.
-    """
 
     # -----------------------------------------------------
-    # 1. Check for an existing order
+    # Prevent duplicate order
     # -----------------------------------------------------
 
     existing_order = (
@@ -537,13 +680,14 @@ def create_fitstore_order(
         return existing_order
 
     # -----------------------------------------------------
-    # 2. Find product
+    # Find product
     # -----------------------------------------------------
 
     product = (
         db.query(Product)
         .filter(
-            Product.id == mandate.product_id
+            Product.id
+            == mandate.product_id
         )
         .first()
     )
@@ -559,7 +703,7 @@ def create_fitstore_order(
         )
 
     # -----------------------------------------------------
-    # 3. Verify stock
+    # Verify stock
     # -----------------------------------------------------
 
     if product.stock < mandate.quantity:
@@ -573,7 +717,7 @@ def create_fitstore_order(
         )
 
     # -----------------------------------------------------
-    # 4. Generate store order number
+    # Generate order number
     # -----------------------------------------------------
 
     order_number = (
@@ -581,7 +725,7 @@ def create_fitstore_order(
     )
 
     # -----------------------------------------------------
-    # 5. Create order
+    # Create order
     # -----------------------------------------------------
 
     order = Order(
@@ -592,13 +736,17 @@ def create_fitstore_order(
             or DEFAULT_BUYER_ID
         ),
 
-        mandate_id=mandate.mandate_id,
+        mandate_id=
+            mandate.mandate_id,
 
-        product_id=mandate.product_id,
+        product_id=
+            mandate.product_id,
 
-        quantity=mandate.quantity,
+        quantity=
+            mandate.quantity,
 
-        amount=mandate.agreed_price,
+        amount=
+            mandate.agreed_price,
 
         currency=(
             mandate.currency
@@ -609,33 +757,29 @@ def create_fitstore_order(
             transaction.razorpay_order_id
         ),
 
-        razorpay_payment_id=(
-            razorpay_payment_id
-        ),
+        razorpay_payment_id=
+            razorpay_payment_id,
 
         status="confirmed",
 
-        created_at=datetime.now(
-            timezone.utc
-        ),
+        created_at=
+            datetime.now(timezone.utc),
     )
 
     db.add(order)
 
     # -----------------------------------------------------
-    # 6. Reduce inventory
+    # Reduce stock
     # -----------------------------------------------------
 
-    product.stock -= mandate.quantity
-
-    # -----------------------------------------------------
-    # 7. Flush changes
-    # -----------------------------------------------------
+    product.stock -= (
+        mandate.quantity
+    )
 
     db.flush()
 
     print(
-        "🏪 FitStore order created!"
+        "\n🏪 FitStore order created!"
     )
 
     print(
@@ -679,7 +823,8 @@ def get_orders(
     orders = (
         db.query(Order)
         .filter(
-            Order.buyer_id == buyer_id
+            Order.buyer_id
+            == buyer_id
         )
         .order_by(
             Order.id.desc()
@@ -702,7 +847,8 @@ def get_orders(
 
         result.append(
             {
-                "id": order.id,
+                "id":
+                    order.id,
 
                 "order_number":
                     order.order_number,
@@ -723,9 +869,11 @@ def get_orders(
                     order.product_id,
 
                 "product_name":
-                    product.name
-                    if product
-                    else None,
+                    (
+                        product.name
+                        if product
+                        else None
+                    ),
 
                 "quantity":
                     order.quantity,
@@ -745,18 +893,21 @@ def get_orders(
                 "status":
                     order.status,
 
-                "created_at": (
-                    order.created_at.isoformat()
-                    if order.created_at
-                    else None
-                ),
+                "created_at":
+                    (
+                        order.created_at.isoformat()
+                        if order.created_at
+                        else None
+                    ),
             }
         )
 
     return result
 
 
-@app.get("/orders/{order_number}")
+@app.get(
+    "/orders/{order_number}"
+)
 def get_order(
     order_number: str,
     db: Session = Depends(get_db),
@@ -788,7 +939,8 @@ def get_order(
     )
 
     return {
-        "id": order.id,
+        "id":
+            order.id,
 
         "order_number":
             order.order_number,
@@ -809,9 +961,11 @@ def get_order(
             order.product_id,
 
         "product_name":
-            product.name
-            if product
-            else None,
+            (
+                product.name
+                if product
+                else None
+            ),
 
         "quantity":
             order.quantity,
@@ -831,11 +985,12 @@ def get_order(
         "status":
             order.status,
 
-        "created_at": (
-            order.created_at.isoformat()
-            if order.created_at
-            else None
-        ),
+        "created_at":
+            (
+                order.created_at.isoformat()
+                if order.created_at
+                else None
+            ),
     }
 
 
@@ -846,23 +1001,21 @@ def get_order(
 def create_order_for_mandate(
     mandate,
 ):
-    """
-    Create a Razorpay order for an existing
-    validated mandate and save the transaction
-    in PostgreSQL.
-    """
 
-    # -----------------------------------------------------
-    # 1. Create Razorpay order
-    # -----------------------------------------------------
+    print(
+        "\n💳 Creating Razorpay order..."
+    )
 
     order = create_razorpay_order(
-        amount=mandate.agreed_price,
-        mandate_id=mandate.mandate_id,
+        amount=
+            mandate.agreed_price,
+
+        mandate_id=
+            mandate.mandate_id,
     )
 
     print(
-        "✅ Razorpay order created!"
+        "\n✅ Razorpay order created!"
     )
 
     print(
@@ -870,31 +1023,30 @@ def create_order_for_mandate(
         order["id"],
     )
 
-    # -----------------------------------------------------
-    # 2. Save Razorpay transaction
-    # -----------------------------------------------------
-
     db = SessionLocal()
 
     try:
 
         transaction = RazorpayTransaction(
-            mandate_id=mandate.mandate_id,
+            mandate_id=
+                mandate.mandate_id,
 
-            razorpay_order_id=order["id"],
+            razorpay_order_id=
+                order["id"],
 
             status="created",
 
-            created_at=datetime.now(
-                timezone.utc
-            ),
+            created_at=
+                datetime.now(timezone.utc),
         )
 
         db.add(transaction)
 
         db.commit()
 
-        db.refresh(transaction)
+        db.refresh(
+            transaction
+        )
 
         print(
             "✅ Razorpay transaction saved!"
@@ -908,16 +1060,11 @@ def create_order_for_mandate(
     except Exception:
 
         db.rollback()
-
         raise
 
     finally:
 
         db.close()
-
-    # -----------------------------------------------------
-    # 3. Return order information
-    # -----------------------------------------------------
 
     return {
         "key_id":
@@ -994,10 +1141,6 @@ def create_order_for_mandate_endpoint(
         "✅ Mandate validated before "
         "Razorpay order creation!"
     )
-
-    # -----------------------------------------------------
-    # Create Razorpay order
-    # -----------------------------------------------------
 
     return create_order_for_mandate(
         mandate
@@ -1089,19 +1232,21 @@ def get_mandate_order(
 # RAZORPAY WEBHOOK
 # =========================================================
 
-@app.post("/webhooks/razorpay")
+@app.post(
+    "/webhooks/razorpay"
+)
 async def razorpay_webhook(
     request: Request,
 ):
 
     # -----------------------------------------------------
-    # 1. Read raw request body
+    # 1. Read raw body
     # -----------------------------------------------------
 
     body = await request.body()
 
     # -----------------------------------------------------
-    # 2. Read Razorpay signature
+    # 2. Read signature
     # -----------------------------------------------------
 
     received_signature = (
@@ -1114,7 +1259,9 @@ async def razorpay_webhook(
 
         raise HTTPException(
             status_code=400,
-            detail="Missing Razorpay signature",
+            detail=(
+                "Missing Razorpay signature"
+            ),
         )
 
     # -----------------------------------------------------
@@ -1128,7 +1275,7 @@ async def razorpay_webhook(
     ).hexdigest()
 
     # -----------------------------------------------------
-    # 4. Verify webhook authenticity
+    # 4. Verify signature
     # -----------------------------------------------------
 
     if not hmac.compare_digest(
@@ -1142,7 +1289,9 @@ async def razorpay_webhook(
 
         raise HTTPException(
             status_code=400,
-            detail="Invalid webhook signature",
+            detail=(
+                "Invalid webhook signature"
+            ),
         )
 
     print(
@@ -1150,12 +1299,14 @@ async def razorpay_webhook(
     )
 
     # -----------------------------------------------------
-    # 5. Parse webhook JSON
+    # 5. Parse JSON
     # -----------------------------------------------------
 
     payload = await request.json()
 
-    event = payload.get("event")
+    event = payload.get(
+        "event"
+    )
 
     print(
         "Webhook event:",
@@ -1174,279 +1325,16 @@ async def razorpay_webhook(
             ["entity"]
         )
 
-        razorpay_payment_id = payment["id"]
+        razorpay_payment_id = (
+            payment["id"]
+        )
 
-        razorpay_order_id = payment["order_id"]
+        razorpay_order_id = (
+            payment["order_id"]
+        )
 
         print(
             "💰 Payment captured!"
-        )
-
-        print(
-            "Payment ID:",
-            razorpay_payment_id,
-        )
-
-        print(
-            "Order ID:",
-            razorpay_order_id,
-        )
-
-        db = SessionLocal()
-
-        try:
-
-            # -------------------------------------------------
-            # 1. Find Razorpay transaction
-            # -------------------------------------------------
-
-            transaction = (
-                db.query(
-                    RazorpayTransaction
-                )
-                .filter(
-                    RazorpayTransaction
-                    .razorpay_order_id
-                    == razorpay_order_id
-                )
-                .first()
-            )
-
-            if transaction is None:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail=(
-                        "Razorpay transaction "
-                        "not found"
-                    ),
-                )
-
-            # -------------------------------------------------
-            # 2. Prevent duplicate processing
-            # -------------------------------------------------
-
-            if transaction.status == "captured":
-
-                print(
-                    "ℹ️ Payment already processed"
-                )
-
-                return {
-                    "status":
-                        "already_processed"
-                }
-
-            # -------------------------------------------------
-            # 3. Find mandate
-            # -------------------------------------------------
-
-            mandate = (
-                db.query(Mandate)
-                .filter(
-                    Mandate.mandate_id
-                    == transaction.mandate_id
-                )
-                .first()
-            )
-
-            if mandate is None:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Mandate not found",
-                )
-
-            # -------------------------------------------------
-            # 4. Find session ID
-            # -------------------------------------------------
-
-            session_id = None
-
-            session_event = (
-                db.query(AuditLog)
-                .filter(
-                    AuditLog.mandate_id
-                    == mandate.mandate_id
-                )
-                .filter(
-                    AuditLog.session_id.isnot(None)
-                )
-                .order_by(
-                    AuditLog.id.desc()
-                )
-                .first()
-            )
-
-            if session_event is not None:
-
-                session_id = (
-                    session_event.session_id
-                )
-
-            # -------------------------------------------------
-            # 5. Create FitStore order
-            # -------------------------------------------------
-
-            fitstore_order = (
-                create_fitstore_order(
-                    db=db,
-                    mandate=mandate,
-                    transaction=transaction,
-                    razorpay_payment_id=(
-                        razorpay_payment_id
-                    ),
-                )
-            )
-
-            # -------------------------------------------------
-            # 6. Execute mandate
-            # -------------------------------------------------
-
-            mandate.status = "executed"
-
-            # -------------------------------------------------
-            # 7. Update Razorpay transaction
-            # -------------------------------------------------
-
-            transaction.razorpay_payment_id = (
-                razorpay_payment_id
-            )
-
-            transaction.status = "captured"
-
-            # -------------------------------------------------
-            # 8. Log payment captured
-            # -------------------------------------------------
-
-            log_audit_event(
-                db,
-                mandate.mandate_id,
-                "payment_captured",
-                {
-                    "razorpay_payment_id":
-                        razorpay_payment_id,
-
-                    "razorpay_order_id":
-                        razorpay_order_id,
-
-                    "amount":
-                        payment.get("amount"),
-
-                    "currency":
-                        payment.get("currency"),
-                },
-                session_id=session_id,
-            )
-
-            # -------------------------------------------------
-            # 9. Log merchant order confirmation
-            # -------------------------------------------------
-
-            log_audit_event(
-                db,
-                mandate.mandate_id,
-                "merchant_order_confirmed",
-                {
-                    "merchant":
-                        MERCHANT_NAME,
-
-                    "merchant_id":
-                        MERCHANT_ID,
-
-                    "order_number":
-                        fitstore_order.order_number,
-
-                    "product_id":
-                        fitstore_order.product_id,
-
-                    "quantity":
-                        fitstore_order.quantity,
-
-                    "amount":
-                        fitstore_order.amount,
-
-                    "currency":
-                        fitstore_order.currency,
-
-                    "status":
-                        fitstore_order.status,
-
-                    "razorpay_payment_id":
-                        razorpay_payment_id,
-                },
-                session_id=session_id,
-            )
-
-            # -------------------------------------------------
-            # 10. Commit entire commerce transaction
-            # -------------------------------------------------
-
-            db.commit()
-
-            print(
-                "🏪 FitStore order confirmed!"
-            )
-
-            print(
-                "Order:",
-                fitstore_order.order_number,
-            )
-
-            print(
-                "✅ Mandate marked as executed!"
-            )
-
-            print(
-                "📝 Payment captured event logged!"
-            )
-
-            print(
-                "📝 Merchant order confirmation logged!"
-            )
-
-            # -------------------------------------------------
-            # 11. Update frontend session
-            # -------------------------------------------------
-
-            if session_id is not None:
-
-                update_session(
-                    session_id=session_id,
-                    status="completed",
-                    mandate_id=str(
-                        mandate.mandate_id
-                    ),
-                )
-
-        except Exception:
-
-            db.rollback()
-
-            raise
-
-        finally:
-
-            db.close()
-
-    # =====================================================
-    # PAYMENT FAILED
-    # =====================================================
-
-    elif event == "payment.failed":
-
-        payment = (
-            payload["payload"]
-            ["payment"]
-            ["entity"]
-        )
-
-        razorpay_payment_id = payment["id"]
-
-        razorpay_order_id = payment["order_id"]
-
-        print(
-            "❌ Payment failed!"
         )
 
         print(
@@ -1490,6 +1378,21 @@ async def razorpay_webhook(
                 )
 
             # -------------------------------------------------
+            # Prevent duplicate processing
+            # -------------------------------------------------
+
+            if transaction.status == "captured":
+
+                print(
+                    "ℹ️ Payment already processed"
+                )
+
+                return {
+                    "status":
+                        "already_processed"
+                }
+
+            # -------------------------------------------------
             # Find mandate
             # -------------------------------------------------
 
@@ -1510,7 +1413,7 @@ async def razorpay_webhook(
                 )
 
             # -------------------------------------------------
-            # Find session ID
+            # Find session
             # -------------------------------------------------
 
             session_id = None
@@ -1522,7 +1425,8 @@ async def razorpay_webhook(
                     == mandate.mandate_id
                 )
                 .filter(
-                    AuditLog.session_id.isnot(None)
+                    AuditLog.session_id
+                    .isnot(None)
                 )
                 .order_by(
                     AuditLog.id.desc()
@@ -1537,6 +1441,26 @@ async def razorpay_webhook(
                 )
 
             # -------------------------------------------------
+            # Create FitStore order
+            # -------------------------------------------------
+
+            fitstore_order = (
+                create_fitstore_order(
+                    db=db,
+                    mandate=mandate,
+                    transaction=transaction,
+                    razorpay_payment_id=
+                        razorpay_payment_id,
+                )
+            )
+
+            # -------------------------------------------------
+            # Execute mandate
+            # -------------------------------------------------
+
+            mandate.status = "executed"
+
+            # -------------------------------------------------
             # Update transaction
             # -------------------------------------------------
 
@@ -1544,17 +1468,215 @@ async def razorpay_webhook(
                 razorpay_payment_id
             )
 
+            transaction.status = "captured"
+
+            # -------------------------------------------------
+            # Audit: payment captured
+            # -------------------------------------------------
+
+            log_audit_event(
+                db,
+                mandate.mandate_id,
+                "payment_captured",
+                {
+                    "razorpay_payment_id":
+                        razorpay_payment_id,
+
+                    "razorpay_order_id":
+                        razorpay_order_id,
+
+                    "amount":
+                        payment.get("amount"),
+
+                    "currency":
+                        payment.get("currency"),
+                },
+                session_id=session_id,
+            )
+
+            # -------------------------------------------------
+            # Audit: merchant order confirmed
+            # -------------------------------------------------
+
+            log_audit_event(
+                db,
+                mandate.mandate_id,
+                "merchant_order_confirmed",
+                {
+                    "merchant":
+                        MERCHANT_NAME,
+
+                    "merchant_id":
+                        MERCHANT_ID,
+
+                    "order_number":
+                        fitstore_order.order_number,
+
+                    "product_id":
+                        fitstore_order.product_id,
+
+                    "quantity":
+                        fitstore_order.quantity,
+
+                    "amount":
+                        fitstore_order.amount,
+
+                    "currency":
+                        fitstore_order.currency,
+
+                    "status":
+                        fitstore_order.status,
+
+                    "razorpay_payment_id":
+                        razorpay_payment_id,
+                },
+                session_id=session_id,
+            )
+
+            # -------------------------------------------------
+            # Commit
+            # -------------------------------------------------
+
+            db.commit()
+
+            print(
+                "🏪 FitStore order confirmed!"
+            )
+
+            print(
+                "Order:",
+                fitstore_order.order_number,
+            )
+
+            print(
+                "✅ Mandate marked as executed!"
+            )
+
+            # -------------------------------------------------
+            # Update frontend
+            # -------------------------------------------------
+
+            if session_id is not None:
+
+                update_session(
+                    session_id=
+                        session_id,
+
+                    status=
+                        "completed",
+
+                    mandate_id=
+                        str(
+                            mandate.mandate_id
+                        ),
+                )
+
+        except Exception:
+
+            db.rollback()
+            raise
+
+        finally:
+
+            db.close()
+
+    # =====================================================
+    # PAYMENT FAILED
+    # =====================================================
+
+    elif event == "payment.failed":
+
+        payment = (
+            payload["payload"]
+            ["payment"]
+            ["entity"]
+        )
+
+        razorpay_payment_id = (
+            payment["id"]
+        )
+
+        razorpay_order_id = (
+            payment["order_id"]
+        )
+
+        print(
+            "❌ Payment failed!"
+        )
+
+        db = SessionLocal()
+
+        try:
+
+            transaction = (
+                db.query(
+                    RazorpayTransaction
+                )
+                .filter(
+                    RazorpayTransaction
+                    .razorpay_order_id
+                    == razorpay_order_id
+                )
+                .first()
+            )
+
+            if transaction is None:
+
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        "Razorpay transaction "
+                        "not found"
+                    ),
+                )
+
+            mandate = (
+                db.query(Mandate)
+                .filter(
+                    Mandate.mandate_id
+                    == transaction.mandate_id
+                )
+                .first()
+            )
+
+            if mandate is None:
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Mandate not found",
+                )
+
+            session_id = None
+
+            session_event = (
+                db.query(AuditLog)
+                .filter(
+                    AuditLog.mandate_id
+                    == mandate.mandate_id
+                )
+                .filter(
+                    AuditLog.session_id
+                    .isnot(None)
+                )
+                .order_by(
+                    AuditLog.id.desc()
+                )
+                .first()
+            )
+
+            if session_event is not None:
+
+                session_id = (
+                    session_event.session_id
+                )
+
+            transaction.razorpay_payment_id = (
+                razorpay_payment_id
+            )
+
             transaction.status = "failed"
 
-            # -------------------------------------------------
-            # Decline mandate
-            # -------------------------------------------------
-
             mandate.status = "declined"
-
-            # -------------------------------------------------
-            # Log failed payment
-            # -------------------------------------------------
 
             log_audit_event(
                 db,
@@ -1577,32 +1699,24 @@ async def razorpay_webhook(
 
             db.commit()
 
-            print(
-                "❌ Mandate marked as declined!"
-            )
-
-            print(
-                "📝 Payment failure logged!"
-            )
-
-            # -------------------------------------------------
-            # Update frontend session
-            # -------------------------------------------------
-
             if session_id is not None:
 
                 update_session(
-                    session_id=session_id,
-                    status="payment_failed",
-                    mandate_id=str(
-                        mandate.mandate_id
-                    ),
+                    session_id=
+                        session_id,
+
+                    status=
+                        "payment_failed",
+
+                    mandate_id=
+                        str(
+                            mandate.mandate_id
+                        ),
                 )
 
         except Exception:
 
             db.rollback()
-
             raise
 
         finally:
@@ -1610,11 +1724,12 @@ async def razorpay_webhook(
             db.close()
 
     # =====================================================
-    # UNKNOWN / OTHER WEBHOOK
+    # OTHER WEBHOOKS
     # =====================================================
 
     return {
-        "status": "received"
+        "status":
+            "received"
     }
 
 
@@ -1622,18 +1737,23 @@ async def razorpay_webhook(
 # LEGACY TEST ENDPOINT
 # =========================================================
 
-@app.post("/create-test-order")
+@app.post(
+    "/create-test-order"
+)
 def create_test_order():
 
-    # -----------------------------------------------------
-    # 1. Create test mandate
-    # -----------------------------------------------------
-
     mandate = create_mandate(
-        buyer_id="test-buyer",
-        product_id=3,
-        quantity=1,
-        agreed_price=850000,
+        buyer_id=
+            "test-buyer",
+
+        product_id=
+            3,
+
+        quantity=
+            1,
+
+        agreed_price=
+            850000,
     )
 
     print(
@@ -1644,10 +1764,6 @@ def create_test_order():
         "Mandate ID:",
         mandate.mandate_id,
     )
-
-    # -----------------------------------------------------
-    # 2. Validate mandate
-    # -----------------------------------------------------
 
     is_valid, reason = validate_mandate(
         mandate.mandate_id
@@ -1666,10 +1782,6 @@ def create_test_order():
     print(
         "✅ Test mandate validated!"
     )
-
-    # -----------------------------------------------------
-    # 3. Create Razorpay order
-    # -----------------------------------------------------
 
     return create_order_for_mandate(
         mandate
